@@ -10,7 +10,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 
 import paramiko
-from rich.console import Console
+from rich.console import Console, Group
 from rich.live import Live
 from rich.panel import Panel
 from rich.progress import (
@@ -21,6 +21,9 @@ from rich.progress import (
     TimeElapsedColumn,
 )
 from rich.table import Table
+
+# --- Global thread-local storage for SSH clients ---
+thread_local_storage = threading.local()
 
 # --- Global thread-safe dictionary to store worker status ---
 worker_status = {}
@@ -77,57 +80,63 @@ class TransferMonitor:
 # --- Download Worker Function (runs in a thread) ---
 def download_file_worker(worker_id, conn_details, remote_path, local_path, timeout):
     """
-    Connects and downloads a single file. Includes a dedicated monitor 
-    thread to enforce the inactivity timeout.
+    Connects and downloads a single file using a persistent SSH connection per worker.
+    Includes a dedicated monitor thread to enforce the inactivity timeout.
     """
-    ssh_client = None
     monitor_thread = None
-    
+    monitor = None
+
     try:
-        with paramiko.SSHClient() as ssh_pre:
-            ssh_pre.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-            ssh_pre.connect(**conn_details, timeout=10)
-            with ssh_pre.open_sftp() as sftp_pre:
-                total_size = sftp_pre.stat(remote_path).st_size
+        # Get or create a persistent SSH connection for this worker thread
+        ssh_client = getattr(thread_local_storage, 'ssh_client', None)
+        if ssh_client is None or not ssh_client.get_transport() or not ssh_client.get_transport().is_active():
+            ssh_client = paramiko.SSHClient()
+            ssh_client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+            ssh_client.connect(**conn_details, timeout=20)
+            thread_local_storage.ssh_client = ssh_client
+
+        # Get file info using the persistent connection
+        with ssh_client.open_sftp() as sftp_pre:
+            total_size = sftp_pre.stat(remote_path).st_size
         monitor = TransferMonitor(worker_id, os.path.basename(remote_path), total_size)
-    except Exception as e:
-        raise IOError(f"Failed to get file info for {os.path.basename(remote_path)}: {e}") from e
 
-    def watchdog():
-        while True:
-            with monitor._lock:
-                if monitor.download_complete: break
-                stalled_time = time.time() - monitor.last_activity_time
-            if stalled_time > timeout:
-                with monitor._lock: monitor.timed_out = True
-                if ssh_client: ssh_client.get_transport().close()
-                break
-            time.sleep(1)
+        def watchdog():
+            while True:
+                with monitor._lock:
+                    if monitor.download_complete: break
+                    stalled_time = time.time() - monitor.last_activity_time
+                if stalled_time > timeout:
+                    with monitor._lock: monitor.timed_out = True
+                    if ssh_client and ssh_client.get_transport():
+                        ssh_client.get_transport().close()
+                    break
+                time.sleep(1)
 
-    try:
-        ssh_client = paramiko.SSHClient()
-        ssh_client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-        ssh_client.connect(**conn_details, timeout=20)
-        
         monitor.set_start_time()
         monitor_thread = threading.Thread(target=watchdog, daemon=True)
         monitor_thread.start()
 
+        # Perform the download
         with ssh_client.open_sftp() as sftp_client:
             sftp_client.get(remote_path, local_path, callback=monitor.progress_callback)
 
     except Exception as e:
-        with monitor._lock:
-            if monitor.timed_out:
-                raise ProgressTimeout(f"No progress for over {timeout} seconds.") from e
+        # If any exception occurs, we'll assume the connection is bad and force a reconnect on the next run
+        thread_local_storage.ssh_client = None
+        
+        if monitor:
+            with monitor._lock:
+                if monitor.timed_out:
+                    raise ProgressTimeout(f"No progress for over {timeout} seconds.") from e
         raise e
         
     finally:
-        with monitor._lock: monitor.download_complete = True
+        if monitor:
+            with monitor._lock: monitor.download_complete = True
         if monitor_thread: monitor_thread.join()
-        if os.path.exists(local_path) and not monitor.download_complete:
+        if monitor and os.path.exists(local_path) and not monitor.download_complete:
              os.remove(local_path)
-        if ssh_client: ssh_client.close()
+        # The persistent SSH client is intentionally not closed here.
 
 # --- UI Generation ---
 def generate_ui(overall_progress, total_files_to_process, success, failed):
@@ -156,8 +165,11 @@ def generate_ui(overall_progress, total_files_to_process, success, failed):
         progress_bar = Progress(TextColumn("[progress.percentage]{task.percentage:>3.0f}%"), BarColumn(bar_width=None), expand=True)
         progress_bar.add_task("download", total=total, completed=transferred)
         worker_table.add_row(f"[bold cyan]{worker_id}", filename, progress_bar, speed, f"{now - last_activity_ts:.1f}s ago")
-        
-    return Panel(worker_table, title="[bold]Active Transfers[/]", border_style="blue", subtitle=f"[dim]Files to Process: {total_files_to_process}[/]")
+
+    active_transfers_panel = Panel(
+        worker_table, title="[bold]Active Transfers[/]", border_style="blue", subtitle=f"[dim]Files to Process: {total_files_to_process}[/]"
+    )
+    return Group(overall_progress, active_transfers_panel)
 
 # --- Main Function ---
 def main():
